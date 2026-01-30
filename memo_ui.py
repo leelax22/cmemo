@@ -388,15 +388,25 @@ class FloatingMemo(QWidget):
     def update_font(self, family_name, display_name=None, size=None, title_size=13, title_bold=True):
         self.font_family = family_name
         safe_font = f"'{family_name}'"
+        
+        # Cache text font size
         font_size = size or getattr(self, "_last_font_size", 14)
         self._last_font_size = font_size
+        
+        # Cache title settings if valid args provided, otherwise use last known
+        if title_size is not None: self._last_title_size = title_size
+        else: title_size = getattr(self, "_last_title_size", 13)
+            
+        if title_bold is not None: self._last_title_bold = title_bold
+        else: title_bold = getattr(self, "_last_title_bold", True)
         
         theme = getattr(self, "_last_theme", "기본형")
         title_color = "white" if theme == "윈도우98" else "black"
         editor_bg = "white" if theme == "윈도우98" else "transparent"
         editor_border = "2px solid #808080" if theme == "윈도우98" else "none"
 
-        self.title_label.setStyleSheet(f"font-family: {safe_font}; font-size: {title_size}px; font-weight: {'bold' if title_bold else 'normal'}; color: {title_color}; background: transparent;")
+        title_weight = 'bold' if title_bold else 'normal'
+        self.title_label.setStyleSheet(f"font-family: {safe_font}; font-size: {title_size}px; font-weight: {title_weight}; color: {title_color}; background: transparent;")
         self.title_edit.setStyleSheet(f"background: rgba(255,255,255,100); border-radius: 4px; font-family: {safe_font}; font-size: {title_size}px; font-weight: normal;")
         
         # Use static base + dynamic part to prevent stylesheet bloating
