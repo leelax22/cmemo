@@ -269,8 +269,15 @@ class FloatingMemo(QWidget):
         self.title_label.show()
 
     def update_elided_title(self):
+        # Allow layout to settle for accurate width
+        QApplication.processEvents()
+        
+        width = self.title_label.width()
+        # If collapsed, we might need to be more aggressive or use a different width basis
+        # But generally trusting the label width is correct if layout is up to date.
+        
         metrics = self.title_label.fontMetrics()
-        elided = metrics.elidedText(self.settings["title"], Qt.TextElideMode.ElideRight, self.title_label.width())
+        elided = metrics.elidedText(self.settings["title"], Qt.TextElideMode.ElideRight, width)
         self.title_label.setText(elided)
 
     def resizeEvent(self, event):
@@ -361,6 +368,11 @@ class FloatingMemo(QWidget):
             
             self.setMinimumWidth(0)
             self.setFixedSize(new_w, 40)
+            
+            # Hide macOS traffic lights if they exist
+            if hasattr(self, 'mac_traffic_lights'):
+                self.mac_traffic_lights.hide()
+                
         else:
             self.setMinimumSize(320, 250)
             self.setMaximumSize(2000, 2000)
@@ -371,13 +383,21 @@ class FloatingMemo(QWidget):
             
             self.content_area.show()
             self.pin_button.show()
-            self.add_button.show()
-            self.settings_button.show()
-            self.delete_button.show()
+            
+            # Restore visibility based on theme
+            theme = getattr(self, "_last_theme", "기본형")
+            if theme == "macOS":
+                if hasattr(self, 'mac_traffic_lights'):
+                    self.mac_traffic_lights.show()
+            else:
+                self.add_button.show()
+                self.settings_button.show()
+                self.delete_button.show()
         
         actual_state = self.settings["is_collapsed"]
         self.settings["is_collapsed"] = is_collapsed
         self.update_style()
+        self.update_elided_title() # Recalculate title after size change
         self.settings["is_collapsed"] = actual_state
 
     def set_bg_color(self, rgba):
