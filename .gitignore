@@ -17,3 +17,8 @@ backups/
 # User Specific
 .agent/
 .gemini/
+
+# PyInstaller
+dist/
+build/
+*.spec
