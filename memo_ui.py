@@ -357,7 +357,7 @@ class FloatingMemo(QWidget):
     def set_collapsed_ui(self, is_collapsed):
         if is_collapsed:
             self.content_area.hide()
-            self.pin_button.hide()
+            # self.pin_button.hide() # User wants Pin visible
             self.add_button.hide()
             self.settings_button.hide()
             self.delete_button.hide()
@@ -372,6 +372,9 @@ class FloatingMemo(QWidget):
             # Hide macOS traffic lights if they exist
             if hasattr(self, 'mac_traffic_lights'):
                 self.mac_traffic_lights.hide()
+            
+            # Ensure pin is visible even when collapsed
+            self.pin_button.show()
                 
         else:
             self.setMinimumSize(320, 250)
@@ -468,7 +471,16 @@ class FloatingMemo(QWidget):
         self.text_editor.viewport().update()
         
         # Reset traffic lights and button visibility
-        if theme == "macOS":
+        if is_collapsed:
+            # If collapsed, hide everything except Title and Pin
+            self.mac_traffic_lights.hide()
+            self.add_button.hide()
+            self.settings_button.hide()
+            self.delete_button.hide()
+            # Ensure proper title alignment even if hidden elements exist
+            self.title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        
+        elif theme == "macOS":
             self.mac_traffic_lights.show()
             self.title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             # Hide standard buttons for macOS
