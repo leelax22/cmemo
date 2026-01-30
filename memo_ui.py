@@ -4,7 +4,7 @@ import os
 import sys
 import ctypes
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QLabel, QFrame, QLineEdit, QMessageBox, QDialog)
+                             QLabel, QFrame, QLineEdit, QMessageBox, QDialog, QApplication)
 from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal, QEvent
 from PyQt6.QtGui import QFont, QCursor
 from widgets import NoteTextEdit
