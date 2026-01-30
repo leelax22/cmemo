@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Vibe-kit internals
+.vibe
+
+# Application Data
+memo_storage.json
+path_config.json
+backups/
+
+# User Specific
+.agent/
+.gemini/
