@@ -415,7 +415,7 @@ class MemoManager:
             self.bring_to_front()
 
     def show_guide(self):
-        guide_path = os.path.join(self.base_dir, "GUIDE.md")
+        guide_path = resource_path("GUIDE.md")
         content = "가이드 파일을 찾을 수 없습니다."
         if os.path.exists(guide_path):
             with open(guide_path, "r", encoding="utf-8") as f:
