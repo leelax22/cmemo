@@ -11,6 +11,18 @@ class NoteTextEdit(QTextEdit):
         self.line_height = 28
         self.viewport().setAutoFillBackground(False)
 
+    def insertFromMimeData(self, source):
+        """
+        Override paste behavior to insert plain text only.
+        This prevents formatting (fonts, colors, sizes) from being pasted.
+        """
+        if source.hasText():
+            # Get plain text from clipboard and insert it
+            self.insertPlainText(source.text())
+        else:
+            # Fallback to default behavior if no plain text is available
+            super().insertFromMimeData(source)
+
     def paintEvent(self, event):
         if self.show_lines:
             painter = QPainter(self.viewport())

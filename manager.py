@@ -4,14 +4,37 @@ import random
 import sys
 import datetime
 import keyboard
+import ctypes
+from ctypes import wintypes
 from PyQt6.QtWidgets import (QApplication, QMenu, QSystemTrayIcon, QStyle, QFileDialog, 
                              QMessageBox, QDialog, QTextBrowser, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QFrame, QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox, QWidget)
-from PyQt6.QtCore import Qt, QTimer, QDateTime, QBuffer, QPointF
+from PyQt6.QtCore import Qt, QTimer, QDateTime, QBuffer, QPointF, QAbstractNativeEventFilter
 from croniter import croniter
 from PyQt6.QtGui import QColor, QFont, QCursor, QAction, QPixmap, QPainter, QPen, QIcon, QFontDatabase, QPolygonF, QBrush
 from memo_ui import FloatingMemo
 from utils import resource_path
+
+class PowerEventFilter(QAbstractNativeEventFilter):
+    """
+    Listens for Windows power events to re-register hotkeys after sleep/resume.
+    """
+    def __init__(self, manager):
+        super().__init__()
+        self.manager = manager
+        self.WM_POWERBROADCAST = 0x0218
+        self.PBT_APMRESUMEAUTOMATIC = 0x0012
+        self.PBT_APMRESUMESUSPEND = 0x0007
+
+    def nativeEventFilter(self, event_type, message):
+        if event_type == b"windows_generic_MSG":
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == self.WM_POWERBROADCAST:
+                if msg.wParam in [self.PBT_APMRESUMEAUTOMATIC, self.PBT_APMRESUMESUSPEND]:
+                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] System resume detected. Resetting hotkeys...")
+                    # Delay to ensure system input handles are ready
+                    QTimer.singleShot(3000, self.manager.setup_hotkeys)
+        return False, 0
 
 class MemoManager:
     """
@@ -83,6 +106,11 @@ class MemoManager:
         if not self.memos: self.create_new_memo()
         
         self.setup_hotkeys()
+        
+        # Install power event filter for resume from sleep
+        self.power_filter = PowerEventFilter(self)
+        QApplication.instance().installNativeEventFilter(self.power_filter)
+        
         self.setup_tray()
 
     def scan_fonts(self):
@@ -379,6 +407,7 @@ class MemoManager:
             icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
             
         self.tray_icon.setIcon(icon)
+        self.tray_icon.setToolTip("CMEMO")
         
         menu = QMenu()
         menu.addAction("📂 모든 메모 보기").triggered.connect(self.bring_to_front)
@@ -402,6 +431,8 @@ class MemoManager:
         storage_menu.addAction("⚙️ 설정 파일 백업").triggered.connect(lambda: self.backup_path_config())
         storage_menu.addAction("📅 정기 백업 설정").triggered.connect(lambda: self.show_auto_backup_settings())
         
+        menu.addSeparator()
+        menu.addAction("⌨️ 단축키 재등록").triggered.connect(self.setup_hotkeys)
         menu.addSeparator()
         menu.addAction("❌ 종료").triggered.connect(self.quit_app)
         
@@ -602,8 +633,12 @@ class MemoManager:
 
     def setup_hotkeys(self):
         try:
+            # Clear existing hooks to prevent duplicate registrations
+            keyboard.unhook_all()
+            
             keyboard.add_hotkey('ctrl+alt+page up', self.bring_to_front)
             keyboard.add_hotkey('ctrl+alt+page down', self.hide_all)
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Hotkeys registered successfully.")
         except Exception as e:
             print(f"Hotkey Error: {e}")
 

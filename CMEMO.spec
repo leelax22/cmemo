@@ -67,6 +67,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['cmemo.ico'],
+    uac_admin=True,
 )
 coll = COLLECT(
     exe,
