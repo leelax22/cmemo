@@ -3,13 +3,14 @@ import json
 import random
 import sys
 import datetime
+import tempfile
 import keyboard
 import ctypes
 from ctypes import wintypes
 from PyQt6.QtWidgets import (QApplication, QMenu, QSystemTrayIcon, QStyle, QFileDialog, 
                              QMessageBox, QDialog, QTextBrowser, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QFrame, QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox, QWidget)
-from PyQt6.QtCore import Qt, QTimer, QDateTime, QBuffer, QPointF, QAbstractNativeEventFilter
+from PyQt6.QtCore import Qt, QTimer, QDateTime, QBuffer, QPointF, QAbstractNativeEventFilter, QObject, pyqtSignal
 from croniter import croniter
 from PyQt6.QtGui import QColor, QFont, QCursor, QAction, QPixmap, QPainter, QPen, QIcon, QFontDatabase, QPolygonF, QBrush
 from memo_ui import FloatingMemo
@@ -36,6 +37,13 @@ class PowerEventFilter(QAbstractNativeEventFilter):
                     QTimer.singleShot(3000, self.manager.setup_hotkeys)
         return False, 0
 
+class HotkeyBridge(QObject):
+    """
+    Bridges keyboard callbacks (worker thread) into the Qt main thread.
+    """
+    show_requested = pyqtSignal()
+    hide_requested = pyqtSignal()
+
 class MemoManager:
     """
     Main controller for managing multiple memos, hotkeys, tray, and storage.
@@ -48,17 +56,23 @@ class MemoManager:
             
         self.path_config_file = os.path.join(self.base_dir, "path_config.json")
         self.save_file = os.path.join(self.base_dir, "memo_storage.json")
-        
-        if os.path.exists(self.path_config_file):
-            try:
-                with open(self.path_config_file, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    custom_path = cfg.get("last_storage_path")
-                    if custom_path and os.path.exists(os.path.dirname(custom_path)):
-                        self.save_file = custom_path
-            except: pass
+
+        cfg = self._read_json_file(self.path_config_file, default={})
+        if isinstance(cfg, dict):
+            custom_path = cfg.get("last_storage_path")
+            if custom_path and os.path.exists(os.path.dirname(custom_path)):
+                self.save_file = custom_path
 
         self.memos = {}
+        self._suspend_save = False
+        self.hotkey_handles = []
+        self.hotkey_bridge = HotkeyBridge()
+        self.hotkey_bridge.show_requested.connect(self.bring_to_front)
+        self.hotkey_bridge.hide_requested.connect(self.hide_all)
+        self.is_admin = self._is_running_as_admin()
+        if sys.platform == "win32" and not self.is_admin:
+            now = datetime.datetime.now().strftime('%H:%M:%S')
+            print(f"[{now}] Running without admin privileges. Hotkeys may not trigger over elevated windows.")
         self.assets_dir = resource_path("assets")
         self._font_cache = {}
         self._icon_cache = {}
@@ -100,6 +114,7 @@ class MemoManager:
         self.backup_check_timer.timeout.connect(self.check_scheduled_backup)
         self.backup_check_timer.start(60000) # 60 seconds
         self._last_backup_time = None
+        self._last_schedule_check = datetime.datetime.now().replace(second=0, microsecond=0)
         
         # Load Existing State
         self.load_memos()
@@ -121,6 +136,71 @@ class MemoManager:
                     name = os.path.splitext(f)[0]
                     fonts[name] = os.path.join(self.assets_dir, f)
         return fonts
+
+    def _log_error(self, context, exc):
+        now = datetime.datetime.now().strftime('%H:%M:%S')
+        print(f"[{now}] {context}: {exc}")
+
+    def _read_json_file(self, path, default=None):
+        if default is None:
+            default = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return default
+        except Exception as e:
+            self._log_error(f"JSON read failed ({path})", e)
+            return default
+
+    def _write_json_atomic(self, path, data):
+        directory = os.path.dirname(path) or "."
+        tmp_path = None
+        try:
+            if not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+
+            fd, tmp_path = tempfile.mkstemp(prefix=".cmemo_", suffix=".tmp", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                # Ensure the descriptor is closed if os.fdopen failed midway.
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+
+            os.replace(tmp_path, path)
+            return True
+        except Exception as e:
+            self._log_error(f"Atomic write failed ({path})", e)
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            return False
+
+    def _normalize_loaded_state(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("저장 데이터 형식이 올바르지 않습니다.")
+
+        if "global" in data:
+            global_data = data.get("global", {})
+            memos = data.get("memos", {})
+            if not isinstance(global_data, dict) or not isinstance(memos, dict):
+                raise ValueError("저장 데이터 구조(global/memos)가 올바르지 않습니다.")
+            return {"global": global_data, "memos": memos}
+
+        # Legacy format: {memo_id: settings, ...}
+        for mid, settings in data.items():
+            if not isinstance(settings, dict):
+                raise ValueError(f"메모 데이터 형식이 잘못되었습니다. (id={mid})")
+        return {"global": {}, "memos": data}
 
     def get_font_name(self, name):
         if name in self._font_cache: return self._font_cache[name]
@@ -170,7 +250,9 @@ class MemoManager:
         try:
             parts = clean.replace("rgba(", "").replace(")", "").split(",")
             color = QColor(int(parts[0]), int(parts[1]), int(parts[2]), 255)
-        except: color = QColor("white")
+        except Exception as e:
+            self._log_error(f"Invalid color value ({rgba_str})", e)
+            color = QColor("white")
         pixmap = QPixmap(24, 24)
         pixmap.fill(Qt.GlobalColor.transparent)
         p = QPainter(pixmap)
@@ -336,6 +418,8 @@ class MemoManager:
 
     def save_memos(self, immediate=False):
         """Requests a save. Defaults to debounced saving for better performance."""
+        if self._suspend_save:
+            return
         if immediate:
             self._perform_save()
         else:
@@ -343,6 +427,20 @@ class MemoManager:
 
     def _get_app_state_data(self):
         """Builds the comprehensive state dictionary for saving/backup."""
+        memos_data = {}
+        stale_ids = []
+        for mid, memo in list(self.memos.items()):
+            try:
+                memos_data[mid] = memo.get_current_settings()
+            except RuntimeError as e:
+                stale_ids.append(mid)
+                self._log_error(f"Skipped stale memo during save ({mid})", e)
+            except Exception as e:
+                self._log_error(f"Failed to serialize memo ({mid})", e)
+
+        for mid in stale_ids:
+            self.memos.pop(mid, None)
+
         return {
             "global": {
                 "theme": self.current_theme, 
@@ -351,7 +449,7 @@ class MemoManager:
                 "title_font_size": self.title_font_size,
                 "title_bold": self.title_bold
             },
-            "memos": {mid: m.get_current_settings() for mid, m in self.memos.items()}
+            "memos": memos_data
         }
 
     def _perform_save(self, path=None):
@@ -359,12 +457,11 @@ class MemoManager:
         self.save_timer.stop()
         target_path = path or self.save_file
         data = self._get_app_state_data()
-        try:
-            with open(target_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
+        if self._write_json_atomic(target_path, data):
             if not path:
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Disk Write: State saved.")
-        except Exception as e: print(e)
+            return True
+        return False
 
     def quit_app(self):
         """Ensures state is saved before quitting."""
@@ -374,28 +471,34 @@ class MemoManager:
     def load_memos(self):
         if not os.path.exists(self.save_file): return
         try:
+            self._suspend_save = True
             with open(self.save_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if "global" in data:
-                    self.current_theme = data["global"].get("theme", self.current_theme)
-                    self.current_font = data["global"].get("font_family", self.current_font)
-                    raw_fs = data["global"].get("font_size", 14)
-                    try:
-                        self.current_font_size = max(6, int(raw_fs))
-                    except:
-                        self.current_font_size = 14
-                    
-                    self.title_font_size = data["global"].get("title_font_size", 13)
-                    self.title_bold = data["global"].get("title_bold", True)
-                    for mid, s in data.get("memos", {}).items():
-                        self.create_new_memo(settings=s, memo_id=mid)
-                else:
-                    for mid, s in data.items(): self.create_new_memo(settings=s, memo_id=mid)
+                loaded = self._normalize_loaded_state(json.load(f))
+                global_data = loaded["global"]
+                memos = loaded["memos"]
+
+                self.current_theme = global_data.get("theme", self.current_theme)
+                self.current_font = global_data.get("font_family", self.current_font)
+                raw_fs = global_data.get("font_size", 14)
+                try:
+                    self.current_font_size = max(6, int(raw_fs))
+                except Exception:
+                    self.current_font_size = 14
+
+                self.title_font_size = global_data.get("title_font_size", 13)
+                self.title_bold = global_data.get("title_bold", True)
+
+                for mid, settings in memos.items():
+                    if isinstance(settings, dict):
+                        self.create_new_memo(settings=settings, memo_id=mid)
+                    else:
+                        self._log_error(f"Skipped invalid memo settings ({mid})", "non-dict value")
             
             self.refresh_all_memos_style()
-        except Exception:
-            import traceback
-            traceback.print_exc()
+        except Exception as e:
+            self._log_error("Failed to load memos", e)
+        finally:
+            self._suspend_save = False
 
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon()
@@ -633,55 +736,70 @@ class MemoManager:
 
     def setup_hotkeys(self):
         try:
-            # Clear existing hooks to prevent duplicate registrations
-            keyboard.unhook_all()
-            
-            keyboard.add_hotkey('ctrl+alt+page up', self.bring_to_front)
-            keyboard.add_hotkey('ctrl+alt+page down', self.hide_all)
+            for handle in self.hotkey_handles:
+                keyboard.remove_hotkey(handle)
+            self.hotkey_handles.clear()
+
+            show_handle = keyboard.add_hotkey(
+                'ctrl+alt+page up',
+                lambda: self.hotkey_bridge.show_requested.emit()
+            )
+            hide_handle = keyboard.add_hotkey(
+                'ctrl+alt+page down',
+                lambda: self.hotkey_bridge.hide_requested.emit()
+            )
+            self.hotkey_handles.extend([show_handle, hide_handle])
             print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Hotkeys registered successfully.")
         except Exception as e:
             print(f"Hotkey Error: {e}")
 
+    @staticmethod
+    def _is_running_as_admin():
+        if sys.platform != "win32":
+            return True
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
     def bring_to_front(self):
         for m in self.memos.values():
-            QTimer.singleShot(0, m.show_and_raise)
+            m.show_and_raise()
 
     def hide_all(self):
         for m in self.memos.values():
-            QTimer.singleShot(0, m.hide)
+            m.hide()
 
     def change_storage_path(self, parent=None):
         if not isinstance(parent, QWidget): parent = None
         path, _ = QFileDialog.getSaveFileName(parent, "새 저장 위치 선택", self.save_file, "JSON (*.json)")
         if path:
+            old_save_file = self.save_file
+            old_backup_folder = self.auto_backup_config.get("folder")
             self.save_file = path
             new_backup_folder = os.path.join(os.path.dirname(path), "backups")
-            
-            cfg = {}
-            if os.path.exists(self.path_config_file):
-                try:
-                    with open(self.path_config_file, "r", encoding="utf-8") as f:
-                        cfg = json.load(f)
-                except: pass
-            
-            cfg["last_storage_path"] = path
-            if "auto_backup" not in cfg:
-                cfg["auto_backup"] = self.auto_backup_config.copy()
-            
-            cfg["auto_backup"]["folder"] = new_backup_folder
             self.auto_backup_config["folder"] = new_backup_folder
             
             if not os.path.exists(new_backup_folder):
-                try: os.makedirs(new_backup_folder)
-                except: pass
-
-            try:
-                with open(self.path_config_file, "w", encoding="utf-8") as f:
-                    json.dump(cfg, f, ensure_ascii=False, indent=4)
-            except: pass
+                try:
+                    os.makedirs(new_backup_folder, exist_ok=True)
+                except Exception as e:
+                    self._log_error("Failed to create backup folder", e)
             
-            self._perform_save() # Save current memos to new location
-            QMessageBox.information(parent, "이동 완료", f"데이터와 백업 위치가 다음으로 이동되었습니다:\n{os.path.dirname(path)}")
+            if self._perform_save(): # Save current memos to new location
+                cfg = self._read_json_file(self.path_config_file, default={})
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                cfg["last_storage_path"] = path
+                if "auto_backup" not in cfg:
+                    cfg["auto_backup"] = self.auto_backup_config.copy()
+                cfg["auto_backup"]["folder"] = new_backup_folder
+                self._write_json_atomic(self.path_config_file, cfg)
+                QMessageBox.information(parent, "이동 완료", f"데이터와 백업 위치가 다음으로 이동되었습니다:\n{os.path.dirname(path)}")
+            else:
+                self.save_file = old_save_file
+                self.auto_backup_config["folder"] = old_backup_folder
+                QMessageBox.warning(parent, "저장 실패", "새 경로로 데이터 저장에 실패했습니다. 경로 권한을 확인해주세요.")
 
     def load_backup_file(self, parent=None):
         """Import content from a backup JSON file into the current storage."""
@@ -690,16 +808,30 @@ class MemoManager:
         if path:
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    backup_data = json.load(f)
-                
-                for m in list(self.memos.values()): m.close()
-                self.memos.clear()
-                
-                with open(self.save_file, "w", encoding="utf-8") as f:
-                    json.dump(backup_data, f, ensure_ascii=False, indent=4)
-                
+                    backup_data = self._normalize_loaded_state(json.load(f))
+
+                timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                snapshot_path = os.path.join(os.path.dirname(self.save_file), f"memo_pre_restore_{timestamp}.json")
+                snapshot_ok = self._perform_save(path=snapshot_path)
+
+                prev_suspend = self._suspend_save
+                self._suspend_save = True
+                try:
+                    for m in list(self.memos.values()):
+                        m.close()
+                    self.memos.clear()
+                finally:
+                    self._suspend_save = prev_suspend
+
+                if not self._write_json_atomic(self.save_file, backup_data):
+                    raise RuntimeError("백업 데이터를 현재 저장소에 기록하지 못했습니다.")
+
                 self.load_memos()
                 if not self.memos: self.create_new_memo()
+                if snapshot_ok:
+                    QMessageBox.information(parent, "복원 완료", f"복원 전 스냅샷을 저장했습니다:\n{snapshot_path}")
+                else:
+                    QMessageBox.information(parent, "복원 완료", "백업 데이터를 불러왔습니다.")
             except Exception as e:
                 QMessageBox.critical(parent, "오류", f"백업 파일을 불러오는 중 오류가 발생했습니다:\n{str(e)}")
 
@@ -730,52 +862,79 @@ class MemoManager:
         
         path, _ = QFileDialog.getSaveFileName(parent, "데이터 백업 저장", default_path, "JSON (*.json)")
         if path:
-            self._perform_save(path=path)
-            QMessageBox.information(parent, "백업 완료", f"데이터가 성공적으로 백업되었습니다:\n{path}")
+            if self._perform_save(path=path):
+                QMessageBox.information(parent, "백업 완료", f"데이터가 성공적으로 백업되었습니다:\n{path}")
+            else:
+                QMessageBox.critical(parent, "백업 실패", "데이터 백업 저장에 실패했습니다.")
 
     # --- Auto Backup & Scheduling Logic ---
 
     def load_auto_backup_config(self):
+        cfg = self._read_json_file(self.path_config_file, default={})
+        if not isinstance(cfg, dict):
+            return
+        raw = cfg.get("auto_backup")
+        if not isinstance(raw, dict):
+            return
+
+        self.auto_backup_config["enabled"] = bool(raw.get("enabled", self.auto_backup_config["enabled"]))
+        self.auto_backup_config["cron"] = str(raw.get("cron", self.auto_backup_config["cron"]))
+        folder = raw.get("folder", self.auto_backup_config["folder"])
+        self.auto_backup_config["folder"] = os.path.normpath(str(folder)) if folder else self.auto_backup_config["folder"]
         try:
-            if os.path.exists(self.path_config_file):
-                with open(self.path_config_file, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    if "auto_backup" in cfg:
-                        self.auto_backup_config.update(cfg["auto_backup"])
-        except: pass
+            retention = int(raw.get("retention", self.auto_backup_config["retention"]))
+        except Exception:
+            retention = self.auto_backup_config["retention"]
+        self.auto_backup_config["retention"] = max(1, min(100, retention))
 
     def save_auto_backup_config(self):
-        try:
+        cfg = self._read_json_file(self.path_config_file, default={})
+        if not isinstance(cfg, dict):
             cfg = {}
-            if os.path.exists(self.path_config_file):
-                with open(self.path_config_file, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-            cfg["auto_backup"] = self.auto_backup_config
-            with open(self.path_config_file, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=4)
-        except: pass
+        cfg["auto_backup"] = self.auto_backup_config
+        self._write_json_atomic(self.path_config_file, cfg)
 
     def show_auto_backup_settings(self):
         dialog = AutoBackupDialog(self.auto_backup_config, self.ui_icons, None)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.auto_backup_config = dialog.get_settings()
+            new_settings = dialog.get_settings()
+            if not croniter.is_valid(new_settings.get("cron", "")):
+                QMessageBox.warning(None, "설정 오류", "유효한 Cron 식을 입력해주세요.")
+                return
+            self.auto_backup_config = new_settings
             self.save_auto_backup_config()
             QMessageBox.information(None, "설정 저장", "정기 백업 설정이 저장되었습니다.")
 
     def check_scheduled_backup(self):
+        now = datetime.datetime.now().replace(second=0, microsecond=0)
+        last_check = self._last_schedule_check
+        self._last_schedule_check = now
+
         if not self.auto_backup_config.get("enabled", False):
             return
             
         cron_expr = self.auto_backup_config.get("cron", "0 * * * *")
-        now = datetime.datetime.now().replace(second=0, microsecond=0)
         
         # Avoid double execution in the same minute
         if self._last_backup_time == now:
             return
 
         try:
-            # Check if now matches the cron schedule
-            if croniter.match(cron_expr, now):
+            if not croniter.is_valid(cron_expr):
+                return
+
+            if last_check is None or last_check > now:
+                last_check = now - datetime.timedelta(minutes=1)
+
+            probe = last_check + datetime.timedelta(minutes=1)
+            should_run = False
+            while probe <= now:
+                if croniter.match(cron_expr, probe):
+                    should_run = True
+                    break
+                probe += datetime.timedelta(minutes=1)
+
+            if should_run:
                 self.perform_auto_backup()
                 self._last_backup_time = now
         except Exception as e:
@@ -783,11 +942,13 @@ class MemoManager:
 
     def perform_auto_backup(self):
         config = self.auto_backup_config
-        folder = config.get("folder")
+        folder = config.get("folder") or os.path.normpath(os.path.join(self.base_dir, "backups"))
         if not os.path.exists(folder):
             try:
-                os.makedirs(folder)
-            except: return
+                os.makedirs(folder, exist_ok=True)
+            except Exception as e:
+                self._log_error("Auto backup folder create failed", e)
+                return
 
         # 1. Create timestamped backup
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M")
@@ -796,8 +957,8 @@ class MemoManager:
         
         try:
             data = self._get_app_state_data()
-            with open(save_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
+            if not self._write_json_atomic(save_path, data):
+                return
             
             print(f"Auto Backup Success: {save_path}")
             
@@ -809,6 +970,7 @@ class MemoManager:
 
     def rotate_backups(self, folder, max_count):
         try:
+            max_count = max(1, int(max_count))
             files = [os.path.join(folder, f) for f in os.listdir(folder) if f.startswith("memo_storage_") and f.endswith(".json")]
             # Sort by modification time (oldest first)
             files.sort(key=os.path.getmtime)
@@ -1125,7 +1287,7 @@ class AutoBackupDialog(QDialog):
             else:
                 self.next_times_text.setText("잘못된 크론 식입니다.")
                 self.next_times_text.setStyleSheet("color: #d93025; font-size: 12px; margin-left: 10px;")
-        except:
+        except Exception:
             self.next_times_text.setText("잘못된 크론 식입니다.")
             self.next_times_text.setStyleSheet("color: #d93025; font-size: 12px; margin-left: 10px;")
 

@@ -25,6 +25,7 @@ class FloatingMemo(QWidget):
         self.memo_id = memo_id or str(uuid.uuid4())
         self.font_family = font_family
         self._last_theme = "기본형"
+        self._closed_notified = False
         
         # Default Settings
         now = datetime.datetime.now()
@@ -269,12 +270,9 @@ class FloatingMemo(QWidget):
         self.title_label.show()
 
     def update_elided_title(self):
-        # Allow layout to settle for accurate width
-        QApplication.processEvents()
-        
         width = self.title_label.width()
-        # If collapsed, we might need to be more aggressive or use a different width basis
-        # But generally trusting the label width is correct if layout is up to date.
+        if width <= 0:
+            width = self.title_label.sizeHint().width()
         
         metrics = self.title_label.fontMetrics()
         elided = metrics.elidedText(self.settings["title"], Qt.TextElideMode.ElideRight, width)
@@ -315,10 +313,20 @@ class FloatingMemo(QWidget):
                 # 4. Hammer the foreground focus if pinning
                 if checked:
                     ctypes.windll.user32.SetForegroundWindow(hwnd)
-            except Exception:
-                pass
+            except Exception as e:
+                now = datetime.datetime.now().strftime('%H:%M:%S')
+                print(f"[{now}] Pin toggle Windows API call failed: {e}")
                 
         self.content_changed.emit()
+
+    def _emit_closed_once(self):
+        if not self._closed_notified:
+            self._closed_notified = True
+            self.closed.emit(self.memo_id)
+
+    def closeEvent(self, event):
+        self._emit_closed_once()
+        super().closeEvent(event)
 
     def show_and_raise(self):
         self.show()
@@ -766,5 +774,4 @@ class FloatingMemo(QWidget):
         layout.addLayout(btn_layout)
         
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.closed.emit(self.memo_id)
             self.close()
