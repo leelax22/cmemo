@@ -4,6 +4,7 @@ import random
 import sys
 import datetime
 import tempfile
+import logging
 import keyboard
 import ctypes
 from ctypes import wintypes
@@ -15,6 +16,8 @@ from croniter import croniter
 from PyQt6.QtGui import QColor, QFont, QCursor, QAction, QPixmap, QPainter, QPen, QIcon, QFontDatabase, QPolygonF, QBrush
 from memo_ui import FloatingMemo
 from utils import resource_path
+
+logger = logging.getLogger("cmemo")
 
 class PowerEventFilter(QAbstractNativeEventFilter):
     """
@@ -32,7 +35,7 @@ class PowerEventFilter(QAbstractNativeEventFilter):
             msg = wintypes.MSG.from_address(int(message))
             if msg.message == self.WM_POWERBROADCAST:
                 if msg.wParam in [self.PBT_APMRESUMEAUTOMATIC, self.PBT_APMRESUMESUSPEND]:
-                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] System resume detected. Resetting hotkeys...")
+                    logger.info("System resume detected. Resetting hotkeys.")
                     # Delay to ensure system input handles are ready
                     QTimer.singleShot(3000, self.manager.setup_hotkeys)
         return False, 0
@@ -71,8 +74,7 @@ class MemoManager:
         self.hotkey_bridge.hide_requested.connect(self.hide_all)
         self.is_admin = self._is_running_as_admin()
         if sys.platform == "win32" and not self.is_admin:
-            now = datetime.datetime.now().strftime('%H:%M:%S')
-            print(f"[{now}] Running without admin privileges. Hotkeys may not trigger over elevated windows.")
+            logger.warning("Running without admin privileges. Hotkeys may not trigger over elevated windows.")
         self.assets_dir = resource_path("assets")
         self._font_cache = {}
         self._icon_cache = {}
@@ -138,8 +140,7 @@ class MemoManager:
         return fonts
 
     def _log_error(self, context, exc):
-        now = datetime.datetime.now().strftime('%H:%M:%S')
-        print(f"[{now}] {context}: {exc}")
+        logger.error("%s: %s", context, exc)
 
     def _read_json_file(self, path, default=None):
         if default is None:
@@ -459,7 +460,7 @@ class MemoManager:
         data = self._get_app_state_data()
         if self._write_json_atomic(target_path, data):
             if not path:
-                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Disk Write: State saved.")
+                logger.info("Disk write: state saved.")
             return True
         return False
 
@@ -749,9 +750,9 @@ class MemoManager:
                 lambda: self.hotkey_bridge.hide_requested.emit()
             )
             self.hotkey_handles.extend([show_handle, hide_handle])
-            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Hotkeys registered successfully.")
+            logger.info("Hotkeys registered successfully.")
         except Exception as e:
-            print(f"Hotkey Error: {e}")
+            logger.exception("Hotkey setup failed: %s", e)
 
     @staticmethod
     def _is_running_as_admin():
@@ -938,7 +939,7 @@ class MemoManager:
                 self.perform_auto_backup()
                 self._last_backup_time = now
         except Exception as e:
-            print(f"Schedule Check Error: {e}")
+            logger.exception("Schedule check error: %s", e)
 
     def perform_auto_backup(self):
         config = self.auto_backup_config
@@ -960,13 +961,13 @@ class MemoManager:
             if not self._write_json_atomic(save_path, data):
                 return
             
-            print(f"Auto Backup Success: {save_path}")
+            logger.info("Auto backup success: %s", save_path)
             
             # 2. Rotation - Delete old files
             self.rotate_backups(folder, config.get("retention", 5))
             
         except Exception as e:
-            print(f"Auto Backup Failed: {e}")
+            logger.exception("Auto backup failed: %s", e)
 
     def rotate_backups(self, folder, max_count):
         try:
@@ -978,9 +979,9 @@ class MemoManager:
             while len(files) > max_count:
                 old_file = files.pop(0)
                 os.remove(old_file)
-                print(f"Rotation: Deleted old backup {old_file}")
+                logger.info("Rotation: deleted old backup %s", old_file)
         except Exception as e:
-            print(f"Rotation Error: {e}")
+            logger.exception("Rotation error: %s", e)
 
 class AutoBackupDialog(QDialog):
     def __init__(self, config, ui_icons, parent=None):

@@ -3,12 +3,15 @@ import uuid
 import os
 import sys
 import ctypes
+import logging
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QFrame, QLineEdit, QMessageBox, QDialog, QApplication)
 from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal, QEvent
 from PyQt6.QtGui import QFont, QCursor
 from widgets import NoteTextEdit
 from utils import resource_path
+
+logger = logging.getLogger("cmemo")
 
 class FloatingMemo(QWidget):
     """
@@ -314,8 +317,7 @@ class FloatingMemo(QWidget):
                 if checked:
                     ctypes.windll.user32.SetForegroundWindow(hwnd)
             except Exception as e:
-                now = datetime.datetime.now().strftime('%H:%M:%S')
-                print(f"[{now}] Pin toggle Windows API call failed: {e}")
+                logger.exception("Pin toggle Windows API call failed: %s", e)
                 
         self.content_changed.emit()
 
