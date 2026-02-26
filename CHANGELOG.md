@@ -1,5 +1,17 @@
 # Changelog
 
+## [2026-02-26]
+- Improved global hotkey observability and diagnosis flow.
+- Added hotkey status tracking (registration attempts/success, last error, trigger counts).
+- Added tray menu group `⌨️ 단축키`:
+  - `🔁 단축키 재등록`
+  - `📊 상태 확인`
+  - `📄 로그 파일 열기`
+- Added tray notifications for hotkey registration success/failure.
+- Added detailed hotkey log events for setup source (`startup`, `manual`, `resume`) and trigger actions (`show`, `hide`).
+- Updated power-resume hotkey re-registration path to be explicitly logged as `resume`.
+- Updated user guide (`README.md`) with hotkey troubleshooting steps and log file location.
+
 ## [2026-01-30]
 - Renamed `GUIDE.md` to `README.md`.
 - Migrated primary branch from `master` to `main`.

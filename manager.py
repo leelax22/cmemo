@@ -37,7 +37,7 @@ class PowerEventFilter(QAbstractNativeEventFilter):
                 if msg.wParam in [self.PBT_APMRESUMEAUTOMATIC, self.PBT_APMRESUMESUSPEND]:
                     logger.info("System resume detected. Resetting hotkeys.")
                     # Delay to ensure system input handles are ready
-                    QTimer.singleShot(3000, self.manager.setup_hotkeys)
+                    QTimer.singleShot(3000, lambda: self.manager.setup_hotkeys("resume"))
         return False, 0
 
 class HotkeyBridge(QObject):
@@ -69,6 +69,21 @@ class MemoManager:
         self.memos = {}
         self._suspend_save = False
         self.hotkey_handles = []
+        self.hotkey_show_combo = "ctrl+alt+page up"
+        self.hotkey_hide_combo = "ctrl+alt+page down"
+        self.hotkey_status = {
+            "registered": False,
+            "register_attempts": 0,
+            "last_attempt_at": None,
+            "last_success_at": None,
+            "last_error": "",
+            "last_source": "",
+            "show_trigger_count": 0,
+            "hide_trigger_count": 0,
+            "last_trigger_at": None,
+            "last_trigger_action": ""
+        }
+        self._pending_hotkey_notification = None
         self.hotkey_bridge = HotkeyBridge()
         self.hotkey_bridge.show_requested.connect(self.bring_to_front)
         self.hotkey_bridge.hide_requested.connect(self.hide_all)
@@ -122,7 +137,7 @@ class MemoManager:
         self.load_memos()
         if not self.memos: self.create_new_memo()
         
-        self.setup_hotkeys()
+        self.setup_hotkeys("startup")
         
         # Install power event filter for resume from sleep
         self.power_filter = PowerEventFilter(self)
@@ -141,6 +156,76 @@ class MemoManager:
 
     def _log_error(self, context, exc):
         logger.error("%s: %s", context, exc)
+
+    @staticmethod
+    def _format_dt(value):
+        if isinstance(value, datetime.datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        return "-"
+
+    @staticmethod
+    def _display_hotkey(combo):
+        return combo.replace("ctrl", "Ctrl").replace("alt", "Alt").replace("page up", "Page Up").replace("page down", "Page Down")
+
+    def _get_log_file_path(self):
+        for handler in logger.handlers:
+            path = getattr(handler, "baseFilename", None)
+            if path:
+                return os.path.abspath(path)
+        return "로그 파일 경로를 찾지 못했습니다."
+
+    def _update_tray_hotkey_tooltip(self):
+        if not hasattr(self, "tray_icon"):
+            return
+        state_text = "정상" if self.hotkey_status.get("registered") else "오류"
+        self.tray_icon.setToolTip(f"CMEMO | 단축키: {state_text}")
+
+    def _notify_hotkey_registration(self, success, source, error_text=""):
+        self._update_tray_hotkey_tooltip()
+        if not hasattr(self, "tray_icon"):
+            self._pending_hotkey_notification = (success, source, error_text)
+            return
+
+        # Avoid noisy popups for automatic resume success.
+        if success and source == "resume":
+            return
+
+        if success:
+            title = "CMEMO 단축키 등록 완료"
+            message = (
+                f"보기: {self._display_hotkey(self.hotkey_show_combo)}\n"
+                f"숨기기: {self._display_hotkey(self.hotkey_hide_combo)}\n"
+                f"원인: {source}"
+            )
+            icon = QSystemTrayIcon.MessageIcon.Information
+        else:
+            title = "CMEMO 단축키 등록 실패"
+            message = f"원인: {source}\n오류: {error_text or '알 수 없음'}\n로그 파일을 확인하세요."
+            icon = QSystemTrayIcon.MessageIcon.Warning
+        self.tray_icon.showMessage(title, message, icon, 7000)
+
+    def _record_hotkey_trigger(self, action):
+        now = datetime.datetime.now()
+        self.hotkey_status["last_trigger_at"] = now
+        self.hotkey_status["last_trigger_action"] = action
+        if action == "show":
+            self.hotkey_status["show_trigger_count"] += 1
+        else:
+            self.hotkey_status["hide_trigger_count"] += 1
+        logger.info(
+            "Hotkey triggered (action=%s, show_count=%s, hide_count=%s)",
+            action,
+            self.hotkey_status["show_trigger_count"],
+            self.hotkey_status["hide_trigger_count"],
+        )
+
+    def _on_show_hotkey(self):
+        self._record_hotkey_trigger("show")
+        self.hotkey_bridge.show_requested.emit()
+
+    def _on_hide_hotkey(self):
+        self._record_hotkey_trigger("hide")
+        self.hotkey_bridge.hide_requested.emit()
 
     def _read_json_file(self, path, default=None):
         if default is None:
@@ -536,18 +621,61 @@ class MemoManager:
         storage_menu.addAction("📅 정기 백업 설정").triggered.connect(lambda: self.show_auto_backup_settings())
         
         menu.addSeparator()
-        menu.addAction("⌨️ 단축키 재등록").triggered.connect(self.setup_hotkeys)
+        hotkey_menu = menu.addMenu("⌨️ 단축키")
+        hotkey_menu.addAction("🔁 단축키 재등록").triggered.connect(lambda: self.setup_hotkeys("manual"))
+        hotkey_menu.addAction("📊 상태 확인").triggered.connect(self.show_hotkey_status)
+        hotkey_menu.addAction("📄 로그 파일 열기").triggered.connect(self.open_hotkey_log)
         menu.addSeparator()
         menu.addAction("❌ 종료").triggered.connect(self.quit_app)
         
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
+        self._update_tray_hotkey_tooltip()
+        if self._pending_hotkey_notification:
+            success, source, error_text = self._pending_hotkey_notification
+            self._pending_hotkey_notification = None
+            self._notify_hotkey_registration(success, source, error_text)
 
     def on_tray_activated(self, reason):
         # Use .value property for enum comparison
         if reason.value == QSystemTrayIcon.ActivationReason.DoubleClick.value:
             self.bring_to_front()
+
+    def show_hotkey_status(self):
+        status = self.hotkey_status
+        reg_text = "정상" if status.get("registered") else "실패"
+        admin_text = "아니오"
+        if sys.platform == "win32" and not self.is_admin:
+            admin_text = "예 (관리자 창에서는 입력이 누락될 수 있음)"
+
+        message = (
+            f"등록 상태: {reg_text}\n"
+            f"보기 단축키: {self._display_hotkey(self.hotkey_show_combo)}\n"
+            f"숨기기 단축키: {self._display_hotkey(self.hotkey_hide_combo)}\n"
+            f"등록 시도 횟수: {status.get('register_attempts', 0)}\n"
+            f"마지막 시도: {self._format_dt(status.get('last_attempt_at'))}\n"
+            f"마지막 성공: {self._format_dt(status.get('last_success_at'))}\n"
+            f"마지막 트리거: {self._format_dt(status.get('last_trigger_at'))} ({status.get('last_trigger_action') or '-'})\n"
+            f"트리거 횟수: show={status.get('show_trigger_count', 0)}, hide={status.get('hide_trigger_count', 0)}\n"
+            f"최근 등록 오류: {status.get('last_error') or '-'}\n"
+            f"권한 제한: {admin_text}\n"
+            f"로그 파일: {self._get_log_file_path()}"
+        )
+        QMessageBox.information(None, "단축키 상태", message)
+
+    def open_hotkey_log(self):
+        path = self._get_log_file_path()
+        if not os.path.exists(path):
+            QMessageBox.warning(None, "로그 파일 없음", f"로그 파일을 찾지 못했습니다.\n{path}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            else:
+                QMessageBox.information(None, "로그 파일 경로", path)
+        except Exception as e:
+            QMessageBox.critical(None, "로그 열기 실패", f"로그 파일 열기에 실패했습니다.\n{e}")
 
     def show_guide(self):
         guide_path = resource_path("GUIDE.md")
@@ -735,24 +863,44 @@ class MemoManager:
         </div>
         """
 
-    def setup_hotkeys(self):
+    def setup_hotkeys(self, source="auto"):
+        self.hotkey_status["register_attempts"] += 1
+        self.hotkey_status["last_attempt_at"] = datetime.datetime.now()
+        self.hotkey_status["last_source"] = source
+        logger.info(
+            "Hotkey setup started (source=%s, attempt=%s)",
+            source,
+            self.hotkey_status["register_attempts"],
+        )
         try:
             for handle in self.hotkey_handles:
                 keyboard.remove_hotkey(handle)
             self.hotkey_handles.clear()
 
             show_handle = keyboard.add_hotkey(
-                'ctrl+alt+page up',
-                lambda: self.hotkey_bridge.show_requested.emit()
+                self.hotkey_show_combo,
+                self._on_show_hotkey
             )
             hide_handle = keyboard.add_hotkey(
-                'ctrl+alt+page down',
-                lambda: self.hotkey_bridge.hide_requested.emit()
+                self.hotkey_hide_combo,
+                self._on_hide_hotkey
             )
             self.hotkey_handles.extend([show_handle, hide_handle])
-            logger.info("Hotkeys registered successfully.")
+            self.hotkey_status["registered"] = True
+            self.hotkey_status["last_success_at"] = datetime.datetime.now()
+            self.hotkey_status["last_error"] = ""
+            logger.info(
+                "Hotkeys registered successfully (source=%s, show=%s, hide=%s)",
+                source,
+                self.hotkey_show_combo,
+                self.hotkey_hide_combo,
+            )
+            self._notify_hotkey_registration(True, source)
         except Exception as e:
-            logger.exception("Hotkey setup failed: %s", e)
+            self.hotkey_status["registered"] = False
+            self.hotkey_status["last_error"] = str(e)
+            logger.exception("Hotkey setup failed (source=%s): %s", source, e)
+            self._notify_hotkey_registration(False, source, str(e))
 
     @staticmethod
     def _is_running_as_admin():
@@ -764,10 +912,12 @@ class MemoManager:
             return False
 
     def bring_to_front(self):
+        logger.info("Applying action: bring_to_front (memo_count=%s)", len(self.memos))
         for m in self.memos.values():
             m.show_and_raise()
 
     def hide_all(self):
+        logger.info("Applying action: hide_all (memo_count=%s)", len(self.memos))
         for m in self.memos.values():
             m.hide()
 
