@@ -18,21 +18,47 @@ from memo_ui import FloatingMemo
 from utils import resource_path
 
 logger = logging.getLogger("cmemo")
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+VK_PRIOR = 0x21      # Page Up
+VK_NEXT = 0x22       # Page Down
+HOTKEY_ID_SHOW = 0xC001
+HOTKEY_ID_HIDE = 0xC002
 
 class PowerEventFilter(QAbstractNativeEventFilter):
     """
-    Listens for Windows power events to re-register hotkeys after sleep/resume.
+    Handles Windows native events for power resume and WM_HOTKEY.
     """
     def __init__(self, manager):
         super().__init__()
         self.manager = manager
         self.WM_POWERBROADCAST = 0x0218
+        self.WM_HOTKEY = 0x0312
         self.PBT_APMRESUMEAUTOMATIC = 0x0012
         self.PBT_APMRESUMESUSPEND = 0x0007
 
     def nativeEventFilter(self, event_type, message):
         if event_type == b"windows_generic_MSG":
             msg = wintypes.MSG.from_address(int(message))
+
+            if msg.message == self.WM_HOTKEY:
+                hotkey_id = int(msg.wParam)
+                if hotkey_id == HOTKEY_ID_SHOW:
+                    logger.info("WM_HOTKEY received (id=%s, action=show)", hotkey_id)
+                    self.manager._on_show_hotkey("winapi")
+                    return True, 0
+                if hotkey_id == HOTKEY_ID_HIDE:
+                    logger.info("WM_HOTKEY received (id=%s, action=hide)", hotkey_id)
+                    self.manager._on_hide_hotkey("winapi")
+                    return True, 0
+                logger.warning("WM_HOTKEY received with unknown id=%s", hotkey_id)
+
             if msg.message == self.WM_POWERBROADCAST:
                 if msg.wParam in [self.PBT_APMRESUMEAUTOMATIC, self.PBT_APMRESUMESUSPEND]:
                     logger.info("System resume detected. Resetting hotkeys.")
@@ -73,6 +99,7 @@ class MemoManager:
         self.hotkey_hide_combo = "ctrl+alt+page down"
         self.hotkey_status = {
             "registered": False,
+            "backend": "-",
             "register_attempts": 0,
             "last_attempt_at": None,
             "last_success_at": None,
@@ -81,7 +108,8 @@ class MemoManager:
             "show_trigger_count": 0,
             "hide_trigger_count": 0,
             "last_trigger_at": None,
-            "last_trigger_action": ""
+            "last_trigger_action": "",
+            "last_trigger_source": ""
         }
         self._pending_hotkey_notification = None
         self.hotkey_bridge = HotkeyBridge()
@@ -178,7 +206,8 @@ class MemoManager:
         if not hasattr(self, "tray_icon"):
             return
         state_text = "정상" if self.hotkey_status.get("registered") else "오류"
-        self.tray_icon.setToolTip(f"CMEMO | 단축키: {state_text}")
+        backend = self.hotkey_status.get("backend", "-")
+        self.tray_icon.setToolTip(f"CMEMO | 단축키: {state_text} ({backend})")
 
     def _notify_hotkey_registration(self, success, source, error_text=""):
         self._update_tray_hotkey_tooltip()
@@ -195,7 +224,8 @@ class MemoManager:
             message = (
                 f"보기: {self._display_hotkey(self.hotkey_show_combo)}\n"
                 f"숨기기: {self._display_hotkey(self.hotkey_hide_combo)}\n"
-                f"원인: {source}"
+                f"원인: {source}\n"
+                f"백엔드: {self.hotkey_status.get('backend', '-')}"
             )
             icon = QSystemTrayIcon.MessageIcon.Information
         else:
@@ -204,28 +234,77 @@ class MemoManager:
             icon = QSystemTrayIcon.MessageIcon.Warning
         self.tray_icon.showMessage(title, message, icon, 7000)
 
-    def _record_hotkey_trigger(self, action):
+    def _record_hotkey_trigger(self, action, source):
         now = datetime.datetime.now()
         self.hotkey_status["last_trigger_at"] = now
         self.hotkey_status["last_trigger_action"] = action
+        self.hotkey_status["last_trigger_source"] = source
         if action == "show":
             self.hotkey_status["show_trigger_count"] += 1
         else:
             self.hotkey_status["hide_trigger_count"] += 1
         logger.info(
-            "Hotkey triggered (action=%s, show_count=%s, hide_count=%s)",
+            "Hotkey triggered (action=%s, source=%s, show_count=%s, hide_count=%s)",
             action,
+            source,
             self.hotkey_status["show_trigger_count"],
             self.hotkey_status["hide_trigger_count"],
         )
 
-    def _on_show_hotkey(self):
-        self._record_hotkey_trigger("show")
+    def _on_show_hotkey(self, source=None):
+        trigger_source = source or self.hotkey_status.get("backend", "unknown")
+        self._record_hotkey_trigger("show", trigger_source)
         self.hotkey_bridge.show_requested.emit()
 
-    def _on_hide_hotkey(self):
-        self._record_hotkey_trigger("hide")
+    def _on_hide_hotkey(self, source=None):
+        trigger_source = source or self.hotkey_status.get("backend", "unknown")
+        self._record_hotkey_trigger("hide", trigger_source)
         self.hotkey_bridge.hide_requested.emit()
+
+    def _unregister_keyboard_hotkeys(self):
+        for handle in self.hotkey_handles:
+            try:
+                keyboard.remove_hotkey(handle)
+            except Exception:
+                pass
+        self.hotkey_handles.clear()
+
+    def _unregister_winapi_hotkeys(self):
+        if sys.platform != "win32":
+            return
+        user32.UnregisterHotKey(None, HOTKEY_ID_SHOW)
+        user32.UnregisterHotKey(None, HOTKEY_ID_HIDE)
+
+    def _register_hotkeys_winapi(self):
+        if sys.platform != "win32":
+            raise RuntimeError("winapi backend is only available on Windows.")
+
+        self._unregister_winapi_hotkeys()
+        mods = MOD_CONTROL | MOD_ALT
+
+        if not user32.RegisterHotKey(None, HOTKEY_ID_SHOW, mods, VK_PRIOR):
+            err = ctypes.get_last_error()
+            raise OSError(err, f"RegisterHotKey(show) failed. winerr={err}")
+
+        if not user32.RegisterHotKey(None, HOTKEY_ID_HIDE, mods, VK_NEXT):
+            err = ctypes.get_last_error()
+            user32.UnregisterHotKey(None, HOTKEY_ID_SHOW)
+            raise OSError(err, f"RegisterHotKey(hide) failed. winerr={err}")
+
+        self.hotkey_status["backend"] = "winapi"
+
+    def _register_hotkeys_keyboard(self):
+        self._unregister_keyboard_hotkeys()
+        show_handle = keyboard.add_hotkey(
+            self.hotkey_show_combo,
+            lambda: self._on_show_hotkey("keyboard")
+        )
+        hide_handle = keyboard.add_hotkey(
+            self.hotkey_hide_combo,
+            lambda: self._on_hide_hotkey("keyboard")
+        )
+        self.hotkey_handles.extend([show_handle, hide_handle])
+        self.hotkey_status["backend"] = "keyboard"
 
     def _read_json_file(self, path, default=None):
         if default is None:
@@ -552,6 +631,8 @@ class MemoManager:
     def quit_app(self):
         """Ensures state is saved before quitting."""
         self._perform_save()
+        self._unregister_keyboard_hotkeys()
+        self._unregister_winapi_hotkeys()
         QApplication.quit()
 
     def load_memos(self):
@@ -651,14 +732,15 @@ class MemoManager:
 
         message = (
             f"등록 상태: {reg_text}\n"
+            f"현재 백엔드: {status.get('backend', '-')}\n"
             f"보기 단축키: {self._display_hotkey(self.hotkey_show_combo)}\n"
             f"숨기기 단축키: {self._display_hotkey(self.hotkey_hide_combo)}\n"
             f"등록 시도 횟수: {status.get('register_attempts', 0)}\n"
             f"마지막 시도: {self._format_dt(status.get('last_attempt_at'))}\n"
             f"마지막 성공: {self._format_dt(status.get('last_success_at'))}\n"
-            f"마지막 트리거: {self._format_dt(status.get('last_trigger_at'))} ({status.get('last_trigger_action') or '-'})\n"
+            f"마지막 트리거: {self._format_dt(status.get('last_trigger_at'))} ({status.get('last_trigger_action') or '-'}, {status.get('last_trigger_source') or '-'})\n"
             f"트리거 횟수: show={status.get('show_trigger_count', 0)}, hide={status.get('hide_trigger_count', 0)}\n"
-            f"최근 등록 오류: {status.get('last_error') or '-'}\n"
+            f"최근 등록 메시지: {status.get('last_error') or '-'}\n"
             f"권한 제한: {admin_text}\n"
             f"로그 파일: {self._get_log_file_path()}"
         )
@@ -867,37 +949,43 @@ class MemoManager:
         self.hotkey_status["register_attempts"] += 1
         self.hotkey_status["last_attempt_at"] = datetime.datetime.now()
         self.hotkey_status["last_source"] = source
+        self.hotkey_status["backend"] = "-"
         logger.info(
             "Hotkey setup started (source=%s, attempt=%s)",
             source,
             self.hotkey_status["register_attempts"],
         )
-        try:
-            for handle in self.hotkey_handles:
-                keyboard.remove_hotkey(handle)
-            self.hotkey_handles.clear()
 
-            show_handle = keyboard.add_hotkey(
-                self.hotkey_show_combo,
-                self._on_show_hotkey
-            )
-            hide_handle = keyboard.add_hotkey(
-                self.hotkey_hide_combo,
-                self._on_hide_hotkey
-            )
-            self.hotkey_handles.extend([show_handle, hide_handle])
+        self._unregister_keyboard_hotkeys()
+        self._unregister_winapi_hotkeys()
+
+        try:
+            fallback_error = None
+            if sys.platform == "win32":
+                try:
+                    self._register_hotkeys_winapi()
+                except Exception as e:
+                    fallback_error = str(e)
+                    logger.exception("WinAPI hotkey register failed; trying keyboard fallback: %s", e)
+                    self._register_hotkeys_keyboard()
+                    logger.warning("Hotkey backend fallback applied: keyboard")
+            else:
+                self._register_hotkeys_keyboard()
+
             self.hotkey_status["registered"] = True
             self.hotkey_status["last_success_at"] = datetime.datetime.now()
-            self.hotkey_status["last_error"] = ""
+            self.hotkey_status["last_error"] = fallback_error or ""
             logger.info(
-                "Hotkeys registered successfully (source=%s, show=%s, hide=%s)",
+                "Hotkeys registered successfully (source=%s, backend=%s, show=%s, hide=%s)",
                 source,
+                self.hotkey_status["backend"],
                 self.hotkey_show_combo,
                 self.hotkey_hide_combo,
             )
             self._notify_hotkey_registration(True, source)
         except Exception as e:
             self.hotkey_status["registered"] = False
+            self.hotkey_status["backend"] = "-"
             self.hotkey_status["last_error"] = str(e)
             logger.exception("Hotkey setup failed (source=%s): %s", source, e)
             self._notify_hotkey_registration(False, source, str(e))

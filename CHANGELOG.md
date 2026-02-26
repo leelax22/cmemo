@@ -3,6 +3,9 @@
 ## [2026-02-26]
 - Improved global hotkey observability and diagnosis flow.
 - Added hotkey status tracking (registration attempts/success, last error, trigger counts).
+- Switched Windows global hotkey backend priority to WinAPI `RegisterHotKey` (`WM_HOTKEY`) and kept `keyboard` as fallback.
+- Added backend visibility (`winapi`/`keyboard`) in tray tooltip and hotkey status dialog.
+- Added trigger source tracking (`winapi`/`keyboard`) to logs and status view for lock/resume diagnosis.
 - Added tray menu group `⌨️ 단축키`:
   - `🔁 단축키 재등록`
   - `📊 상태 확인`
