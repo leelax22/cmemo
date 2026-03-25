@@ -681,6 +681,7 @@ class MemoManager:
         
         menu = QMenu()
         menu.addAction("📂 모든 메모 보기").triggered.connect(self.bring_to_front)
+        menu.addAction("🎯 메모 위치 재조정").triggered.connect(self.realign_memos)
         menu.addSeparator()
         menu.addAction("📖 사용법 가이드").triggered.connect(self.show_guide)
         menu.addAction("➕ 새 메모").triggered.connect(lambda: self.create_new_memo())
@@ -1008,6 +1009,21 @@ class MemoManager:
         logger.info("Applying action: hide_all (memo_count=%s)", len(self.memos))
         for m in self.memos.values():
             m.hide()
+
+    def realign_memos(self):
+        """화면 밖이나 보조 모니터에 있는 메모들만 주 모니터의 가시 영역 안으로 불러옵니다."""
+        logger.info("Applying action: realign_memos")
+        moved_count = 0
+        for m in self.memos.values():
+            # only_off_screen=False로 설정하여 보조 모니터에 있는 메모도 주 모니터로 소환
+            if m.ensure_visible_on_screen(only_off_screen=False):
+                moved_count += 1
+        
+        if moved_count > 0:
+            self.save_memos(immediate=True)
+            QMessageBox.information(None, "위치 재조정 완료", f"{moved_count}개의 메모를 주 모니터로 불러왔습니다.\n(기존 상대 비율 위치를 유지합니다.)")
+        else:
+            QMessageBox.information(None, "위치 재조정", "모든 메모가 이미 주 모니터 안에 정상적으로 위치하고 있습니다.")
 
     def change_storage_path(self, parent=None):
         if not isinstance(parent, QWidget): parent = None

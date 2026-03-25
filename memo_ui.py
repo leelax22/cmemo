@@ -669,8 +669,29 @@ class FloatingMemo(QWidget):
         self.text_editor.blockSignals(False)
         self.setWindowOpacity(1.0)
         
-        self.move(self.settings.get("x", 100), self.settings.get("y", 100))
+        # 상대 비율 데이터가 있고 해당 모니터가 존재하면 비율 배치, 아니면 절대 좌표 유지
+        x_ratio = self.settings.get("x_ratio")
+        y_ratio = self.settings.get("y_ratio")
+        screen_idx = self.settings.get("screen_index")
+        
+        screens = QApplication.screens()
+        
+        if screen_idx is not None and screen_idx < len(screens):
+            # 저장된 모니터가 현재 존재함 -> 비율 기반 배치
+            target_screen = screens[screen_idx]
+            geom = target_screen.geometry()
+            final_x = geom.x() + int(geom.width() * x_ratio)
+            final_y = geom.y() + int(geom.height() * y_ratio)
+        else:
+            # 저장된 모니터가 없음 -> 절대 좌표 그대로 사용 (비가시 영역 대기 가능)
+            final_x = self.settings.get("x", 100)
+            final_y = self.settings.get("y", 100)
+
+        self.move(final_x, final_y)
         self.resize(self.settings.get("w", 320), self.settings.get("h", 420))
+        
+        # (자동 보정 제거) 사용자가 버튼을 누르기 전까지는 위치를 강제하지 않음
+
         if self.settings.get("is_collapsed", False):
             self.set_collapsed_ui(True)
         
@@ -682,18 +703,73 @@ class FloatingMemo(QWidget):
             
         self.show()
         
-        # Apply pin state after show to ensure window handle is ready and flags apply
         pin_state = self.settings.get("is_pinned", False)
         self.pin_button.setChecked(pin_state)
         self.toggle_pin(pin_state)
 
+    def ensure_visible_on_screen(self, only_off_screen=True):
+        """
+        창의 위치를 확인하고 가시성을 확보합니다.
+        only_off_screen=True: 완전히 화면 밖인 경우만 소환
+        only_off_screen=False: 보조 모니터에 있는 경우까지 주 모니터로 소환
+        """
+        curr_pos = self.pos()
+        screen = QApplication.screenAt(curr_pos)
+        primary_screen = QApplication.primaryScreen()
+        
+        # 소환 조건: 
+        # 1. 아예 화면 밖인 경우 (무조건 소환)
+        # 2. '모두 주 모니터로 소환' 모드인데 현재 주 모니터가 아닌 경우
+        should_recover = (not screen) or (not only_off_screen and screen != primary_screen)
+        
+        if should_recover:
+            # 주 모니터 정보 가져오기
+            geom = primary_screen.geometry()
+            
+            # 기존에 저장된 비율(없으면 0.1 기본값)을 주 모니터 해상도에 적용하여 위치 계산
+            x_ratio = self.settings.get("x_ratio", 0.1)
+            y_ratio = self.settings.get("y_ratio", 0.1)
+            
+            new_x = geom.x() + int(geom.width() * x_ratio)
+            new_y = geom.y() + int(geom.height() * y_ratio)
+            
+            self.move(new_x, new_y)
+            
+            # 메모 설정 정보도 주 모니터 기준으로 즉시 갱신
+            self.settings["screen_index"] = 0
+            self.settings["is_primary_screen"] = True
+            
+            logger.info("Memo %s moved/recovered to primary screen (Reason: off-screen or secondary monitor).", self.memo_id)
+            return True
+        return False
+        
     def get_current_settings(self):
         for k in ["font_family", "font_size", "theme"]:
             if k in self.settings: del self.settings[k]
             
+        screen = QApplication.screenAt(self.geometry().center())
+        if not screen:
+            screen = QApplication.primaryScreen()
+            
+        geom = screen.geometry()
+        screens = QApplication.screens()
+        try:
+            screen_idx = screens.index(screen)
+        except ValueError:
+            screen_idx = 0
+            
+        # 모니터 내 상대 비율 계산
+        x_ratio = (self.x() - geom.x()) / geom.width() if geom.width() > 0 else 0
+        y_ratio = (self.y() - geom.y()) / geom.height() if geom.height() > 0 else 0
+
         self.settings.update({
             "content": self.text_editor.toPlainText(),
-            "x": self.x(), "y": self.y(),
+            "x": self.x(), 
+            "y": self.y(),
+            "x_ratio": round(x_ratio, 4),
+            "y_ratio": round(y_ratio, 4),
+            "screen_index": int(screen_idx),
+            "is_primary_screen": (screen == QApplication.primaryScreen()),
             "w": self.width(), "h": self.height()
         })
         return self.settings
